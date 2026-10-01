@@ -20,20 +20,32 @@ from typing import (
     ClassVar,
     Tuple,
     Dict,
+    List,
     cast
 )
 
 import sys
 import os
 import enum
+import json
+import base64
 import socket
+import argparse
 import ipaddress
 import asyncio
 import configparser
 
 from abc import ABC, abstractmethod
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
+
+# netplay-relay: this fork's additions, kept apart from the tunnel protocol --
+# command-line flags, stderr logging, and a read-only status listener that
+# answers GET /sessions with the open sessions' ids. RetroArch only ever
+# publishes a host's session id through the public libretro lobby; a private
+# relay has to say it itself for a client to join with --mitm-session.
+VERSION = "1.0.0"
+UPSTREAM = "libretro/netplay-tunnel-server@23ddaba"
 
 class Error(Exception):
     pass
@@ -48,12 +60,13 @@ class LogLevel(enum.IntEnum):
 class Logger:
     __slots__ = ("__path", "__level", "__lock")
 
-    __path:  Path
+    __path:  Optional[Path]
     __level: LogLevel
 
     __lock: asyncio.Lock
 
-    def __init__(self, path: Path, level: LogLevel = LogLevel.NONE):
+    # path None: log to stderr (journald under systemd).
+    def __init__(self, path: Optional[Path], level: LogLevel = LogLevel.NONE):
         self.__path  = path
         self.__level = level
 
@@ -67,6 +80,10 @@ class Logger:
             now: datetime = datetime.now()
 
             async with self.__lock:
+                if self.__path is None:
+                    print(f"[{level.name}] {message}", file = sys.stderr, flush = True)
+                    return
+
                 try:
                     with self.__path.open("a", encoding = "UTF-8") as log:
                         log.write(f"({now:%d}/{now:%m}/{now:%Y} {now:%H}:{now:%M}:{now:%S}) [{level.name}] {message}\n")
@@ -83,7 +100,8 @@ class Config:
         "__session_max",
         "__session_clients",
         "__log_path",
-        "__log_level"
+        "__log_level",
+        "__bind"
     )
 
     __server_port:    int
@@ -92,10 +110,14 @@ class Config:
     __session_max:     int
     __session_clients: int
 
-    __log_path:  Path
+    __log_path:  Optional[Path]
     __log_level: LogLevel
 
+    __bind: Optional[str]
+
     def __init__(self, path: Optional[Path] = None):
+        self.__bind = None # All interfaces, as upstream.
+
         if path is None:
             path = Path(sys.argv[0]).with_suffix(".ini")
 
@@ -196,6 +218,30 @@ class Config:
     def log_path(self)                -> Path:     return self.__log_path
     @property
     def log_level(self)               -> LogLevel: return self.__log_level
+    @property
+    def bind(self)                    -> Optional[str]: return self.__bind
+
+    @classmethod
+    def from_values(cls, port: int, bind: Optional[str] = None, timeout: float = 120.0,
+                    max_sessions: int = 128, clients: int = 8,
+                    log_level: LogLevel = LogLevel.INFO) -> Config:
+        # The .ini's values from flags; the log goes to stderr.
+        if port not in range(1, 65536):
+            raise ConfigError("Invalid server port.")
+        if timeout <= 0:
+            raise ConfigError("Invalid server timeout.")
+        if max_sessions < 0 or clients < 0:
+            raise ConfigError("Invalid session limits.")
+
+        config: Config = cls.__new__(cls)
+        config.__server_port     = port
+        config.__server_timeout  = timeout
+        config.__session_max     = max_sessions
+        config.__session_clients = clients
+        config.__log_path        = None
+        config.__log_level       = log_level
+        config.__bind            = bind
+        return config
 
 class TunnelError(Error):
     pass
@@ -279,11 +325,13 @@ class TunnelClient(Tunnel):
             self._unique = unique
 
 class SessionOwner(TunnelClient):
-    __slots__ = ("__connected", "__ready")
+    __slots__ = ("__connected", "__ready", "__created")
 
     __connected: Dict[bytes, TunnelClient]
 
     __ready: bool
+
+    __created: datetime
 
     def __init__(self, config: Config, logger: Logger, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         super().__init__(config, logger, reader, writer)
@@ -291,6 +339,12 @@ class SessionOwner(TunnelClient):
         self.__connected = {self.INVALID_UNIQUE: self} # Host counts as one.
 
         self.__ready = False
+
+        self.__created = datetime.now(timezone.utc)
+
+    @property
+    def created(self) -> datetime:
+        return self.__created
 
     def __bool__(self) -> bool:
         return self.__ready
@@ -602,6 +656,32 @@ class TunnelServer(Tunnel):
             await client.set_unique(unique)
             self.__clients[unique] = client
 
+    async def sessions(self) -> List[Dict[str, str]]:
+        # Open sessions, newest first, as a client would join them: the id is
+        # base64 of the 12-byte unique, what RetroArch's --mitm-session takes.
+        async with self._lock:
+            owners: List[SessionOwner] = [c for c in self.__clients.values() if isinstance(c, SessionOwner)]
+
+        listed: List[Tuple[datetime, Dict[str, str]]] = []
+
+        for owner in owners:
+            if not owner:
+                continue # Not ready yet, or already closing.
+
+            try:
+                host: str = owner.address
+            except Exception:
+                continue
+
+            listed.append((owner.created, {
+                "id":    base64.b64encode(await owner.unique()).decode("ascii"),
+                "host":  host,
+                "since": owner.created.isoformat(timespec = "seconds")
+            }))
+
+        listed.sort(key = lambda item: item[0], reverse = True)
+        return [entry for _, entry in listed]
+
     async def __remove_client(self, client: TunnelClient) -> None:
         async with self._lock:
             try:
@@ -764,9 +844,9 @@ class TunnelServer(Tunnel):
 
         try:
             if sys.platform == "win32":
-                server = await asyncio.start_server(self.__handle_client, port = self._config.port)
+                server = await asyncio.start_server(self.__handle_client, host = self._config.bind, port = self._config.port)
             else:
-                server = await asyncio.start_server(self.__handle_client, port = self._config.port, reuse_port = True)
+                server = await asyncio.start_server(self.__handle_client, host = self._config.bind, port = self._config.port, reuse_port = True)
         except Exception:
             raise TunnelError("Failed to create tunnel server.")
         else:
@@ -786,12 +866,102 @@ class TunnelServer(Tunnel):
 
             await server.serve_forever()
 
-async def main() -> None:
-    config: Config       = Config(Path(sys.argv[1].strip()) if len(sys.argv) > 1 else None)
+class StatusServer:
+    # Read-only HTTP: GET /sessions answers the tunnel server's open sessions
+    # as JSON. Nothing here can create, change or end a session.
+    __slots__ = ("__tunnel", "__bind", "__port")
+
+    def __init__(self, tunnel: TunnelServer, bind: Optional[str], port: int):
+        self.__tunnel = tunnel
+        self.__bind   = bind
+        self.__port   = port
+
+    async def __handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        status: str = "404 Not Found"
+        body:   bytes = b'{"error": "not found"}'
+
+        try:
+            request: bytes = await asyncio.wait_for(reader.readline(), 5)
+            parts = request.decode("latin-1").split()
+
+            # Drain the headers; nothing in them matters.
+            while True:
+                line: bytes = await asyncio.wait_for(reader.readline(), 5)
+                if line in (b"", b"\r\n", b"\n"):
+                    break
+
+            if len(parts) >= 2 and parts[0] != "GET":
+                status, body = "405 Method Not Allowed", b'{"error": "GET only"}'
+            elif len(parts) >= 2 and parts[1].split("?", 1)[0] == "/sessions":
+                status = "200 OK"
+                body   = json.dumps({"sessions": await self.__tunnel.sessions()}).encode("utf-8")
+
+            writer.write(
+                f"HTTP/1.0 {status}\r\n"
+                f"Content-Type: application/json\r\n"
+                f"Content-Length: {len(body)}\r\n"
+                f"Cache-Control: no-store\r\n"
+                f"Connection: close\r\n\r\n".encode("ascii") + body
+            )
+            await writer.drain()
+        except Exception:
+            pass
+        finally:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+    async def __call__(self) -> None:
+        server: asyncio.AbstractServer = await asyncio.start_server(self.__handle, host = self.__bind, port = self.__port)
+
+        async with server:
+            for sock in server.sockets:
+                sock_info = sock.getsockname()
+                print(f"[*] Status server listening on: {sock_info[0]}|{sock_info[1]}", flush = True)
+
+            await server.serve_forever()
+
+def parse_args(argv: List[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog = "netplay-relay",
+        description = "RetroArch netplay tunnel (MITM) server with a session listing."
+    )
+    parser.add_argument("ini", nargs = "?", type = Path,
+                        help = "upstream-style .ini; when given, the flags below except --status-port are ignored")
+    parser.add_argument("--bind", default = None, help = "address to listen on (default: all)")
+    parser.add_argument("--port", type = int, default = 55435, help = "tunnel port (default 55435)")
+    parser.add_argument("--status-port", type = int, default = 0,
+                        help = "serve GET /sessions on this port; 0 turns it off (default)")
+    parser.add_argument("--timeout", type = float, default = 120.0, help = "link timeout in seconds")
+    parser.add_argument("--max-sessions", type = int, default = 128)
+    parser.add_argument("--max-clients", type = int, default = 8, help = "per session, host included")
+    parser.add_argument("--log-level", default = "info", choices = [l.name.lower() for l in LogLevel])
+    parser.add_argument("--version", action = "version", version = f"netplay-relay {VERSION} ({UPSTREAM})")
+    return parser.parse_args(argv)
+
+async def main(argv: Optional[List[str]] = None) -> None:
+    args = parse_args(sys.argv[1:] if argv is None else argv)
+
+    config: Config
+    if args.ini is not None:
+        config = Config(args.ini)
+    else:
+        config = Config.from_values(args.port, args.bind, args.timeout, args.max_sessions,
+                                    args.max_clients, LogLevel[args.log_level.upper()])
+
     logger: Logger       = Logger(config.log_path, config.log_level)
     server: TunnelServer = TunnelServer(config, logger)
 
-    await server()
+    if args.status_port:
+        await asyncio.gather(server(), StatusServer(server, config.bind, args.status_port)())
+    else:
+        await server()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except (ConfigError, TunnelError) as e:
+        print(f"netplay-relay: {e}", file = sys.stderr)
+        sys.exit(1)

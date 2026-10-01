@@ -5,3 +5,6 @@
 dmypy.json
 
 *.log
+__pycache__/
+result
+result-*
